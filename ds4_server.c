@@ -7721,6 +7721,8 @@ struct server {
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    /* API key for request authentication; NULL or "" means no auth. */
+    char *api_key;
     pthread_mutex_t tool_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -11083,6 +11085,13 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    /* Buffer for API key extracted from request headers.
+       Populated during header parsing from either:
+       - Authorization: Bearer <key>
+       - x-api-key: <key>
+       Size 512 is generous for any reasonable API key.
+       Keys exceeding 512 chars are silently truncated with a warning. */
+    char auth[512];
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -11098,6 +11107,72 @@ static ssize_t header_end(const char *p, size_t n) {
         if (p[i - 1] == '\n' && p[i] == '\n') return (ssize_t)(i + 1);
     }
     return -1;
+}
+
+/* Extract API key from HTTP headers into r->auth.
+   Supports two formats:
+     - Authorization: Bearer <key>
+     - x-api-key: <key>
+   The first matching header wins; subsequent headers are ignored.
+   Keys exceeding 511 chars are truncated with a warning log.
+   If no auth header is found, r->auth[0] is set to '\0'. */
+static void extract_auth_from_headers(http_request *r,
+                                       const char *buffer_ptr,
+                                       size_t header_end_offset) {
+    r->auth[0] = '\0';
+    const char *header_ptr = buffer_ptr;
+    const char *header_end  = buffer_ptr + header_end_offset;
+    while (header_ptr < header_end) {
+        const char *line_end = header_ptr;
+        while (line_end < header_end && *line_end != '\n') {
+            line_end++;
+        }
+        size_t header_line_len = (size_t)(line_end - header_ptr);
+        if (header_line_len > 0 && header_ptr[header_line_len - 1] == '\r') {
+            header_line_len--;
+        }
+        if (header_line_len >= 15 &&
+            strncasecmp(header_ptr, "Authorization: ", 15) == 0)
+        {
+            const char *value_ptr = header_ptr + 15;
+            while (value_ptr < header_ptr + header_line_len &&
+                   isspace((unsigned char)*value_ptr))
+            {
+                value_ptr++;
+            }
+            if (header_line_len >= 23 &&
+                strncasecmp(value_ptr, "Bearer ", 7) == 0)
+            {
+                value_ptr += 7;
+                size_t value_len = (size_t)(header_ptr + header_line_len - value_ptr);
+                if (value_len > sizeof(r->auth) - 1) {
+                    server_log(DS4_LOG_DEFAULT,
+                               "ds4-server: auth key truncated (>511 chars)");
+                    value_len = sizeof(r->auth) - 1;
+                }
+                memcpy(r->auth, value_ptr, value_len);
+                r->auth[value_len] = '\0';
+            }
+        } else if (header_line_len >= 10 &&
+                   strncasecmp(header_ptr, "x-api-key:", 10) == 0)
+        {
+            const char *value_ptr = header_ptr + 10;
+            while (value_ptr < header_ptr + header_line_len &&
+                   isspace((unsigned char)*value_ptr))
+            {
+                value_ptr++;
+            }
+            size_t value_len = (size_t)(header_ptr + header_line_len - value_ptr);
+            if (value_len > sizeof(r->auth) - 1) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: auth key truncated (>511 chars)");
+                value_len = sizeof(r->auth) - 1;
+            }
+            memcpy(r->auth, value_ptr, value_len);
+            r->auth[value_len] = '\0';
+        }
+        header_ptr = line_end < header_end ? line_end + 1 : header_end;
+    }
 }
 
 static long content_length(const char *h, size_t n) {
@@ -11142,7 +11217,12 @@ static bool read_http_request(int fd, http_request *r) {
     line[i] = '\0';
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
-    if (q) *q = '\0';
+    if (q) {
+        *q = '\0';
+    }
+
+    /* Extract API key from HTTP headers into r->auth for later validation. */
+    extract_auth_from_headers(r, b.ptr, (size_t)hend);
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
@@ -11244,6 +11324,37 @@ static void client_done(server *s) {
 
 static void set_client_socket_nonblocking(int fd);
 
+/* Check API key authentication for an incoming request.
+   Called only when s->api_key is set. Sends a 401 response and
+   returns false if authentication fails; returns true on success.
+   The caller must http_request_free(&hr) and goto done on false.
+   Received keys are truncated to 8 chars in logs to avoid credential leakage. */
+static bool check_api_key_auth(server *s, int fd, http_request *hr) {
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: auth check for %s %s — received auth='%.8s...', expected='%.8s...'",
+               hr->method, hr->path,
+               hr->auth[0] ? hr->auth : "(none)",
+               s->api_key);
+    if (!hr->auth[0]) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: auth rejected — no auth header present");
+        http_error(fd, s->enable_cors, 401, "invalid API key");
+        return false;
+    }
+    if (strncmp(hr->auth, s->api_key, sizeof(hr->auth)) != 0) {
+        /* Log lengths only, not the actual key content, to prevent
+           credential leakage into system logs. */
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: auth rejected — key mismatch (received length=%zu, expected length=%zu)",
+                   strnlen(hr->auth, sizeof(hr->auth)), strnlen(s->api_key, sizeof(hr->auth)));
+        http_error(fd, s->enable_cors, 401, "invalid API key");
+        return false;
+    }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: auth accepted for %s %s", hr->method, hr->path);
+    return true;
+}
+
 static void *client_main(void *arg) {
     client_arg *ca = arg;
     server *s = ca->srv;
@@ -11260,6 +11371,17 @@ static void *client_main(void *arg) {
         http_response(fd, s->enable_cors, 204, NULL, "");
         http_request_free(&hr);
         goto done;
+    }
+
+    /* API key authentication check.
+       Only performed when --api-key was set at startup.
+       Returns true if auth passes; on failure sends 401, cleans up hr,
+       and returns false so caller can goto done. */
+    if (s->api_key && s->api_key[0]) {
+        if (!check_api_key_auth(s, fd, &hr)) {
+            http_request_free(&hr);
+            goto done;
+        }
     }
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
@@ -11402,6 +11524,8 @@ typedef struct {
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
+    /* API key from --api-key CLI option; NULL if not set. */
+    char *api_key;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -11469,6 +11593,9 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
+    /* Free API key string allocated via xstrdup in parse_options. */
+    free(s->api_key);
+    s->api_key = NULL;
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
@@ -11572,6 +11699,10 @@ static server_config parse_options(int argc, char **argv) {
             c.host = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--port")) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--api-key")) {
+            /* Require an API key for all HTTP requests.
+               The key is copied via xstrdup so it persists after argv parsing. */
+            c.api_key = xstrdup(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--trace")) {
@@ -11740,6 +11871,13 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.api_key = cfg.api_key;
+    /* If an API key was provided, enable authentication.
+       The key itself is never logged — only the fact that auth is active. */
+    if (s.api_key && s.api_key[0]) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: API key authentication enabled");
+    }
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
